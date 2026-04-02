@@ -1,0 +1,36 @@
+name: Generate & Deploy Backup Permission Set
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 6 * * 1"  # Weekly on Monday at 06:00 UTC
+
+jobs:
+  generate-backup-perms:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install Salesforce CLI
+        run: npm install -g @salesforce/cli
+
+      - name: Authenticate to Salesforce
+        run: |
+          echo "${{ secrets.SF_AUTH_URL }}" > auth_url.txt
+          sf org login sfdx-url --sfdx-url-file auth_url.txt --set-default --alias ci-org
+          rm auth_url.txt
+
+      - name: Generate and deploy permission set
+        run: python permishifizer9000.py --target-org ci-org --deploy --deploy-wait 10
+
+      - name: Assign permission set
+        run: |
+          sf org assign permset \
+            --name SalesforceBackup \
+            --target-org ci-org

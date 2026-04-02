@@ -1,36 +1,595 @@
-name: Generate & Deploy Backup Permission Set
+# ============================================================================
+# Automated Salesforce Permission Set Full Reconciliation — GitHub Actions
+# ============================================================================
+#
+# Architecture: Full reconciliation on every run — no delta tracking.
+#
+#   1. Check token health & warn on imminent expiry
+#   2. Regenerate the entire Permission Set XML from the live org
+#   3. Diff against the previously committed version (drift report)
+#   4. Structural + cardinality validation (optionally check-only deploy)
+#   5. Commit the regenerated XML to the repo
+#   6. Deploy the full XML back to Salesforce
+#   7. If deployment fails, heal_permset.py auto-patches and retries (×5)
+#   8. Send Teams/Slack notification on success, failure, or heal events
+#
+# Multi-org support: add entries to the org-configs matrix below.
+# Each entry runs as a parallel job and requires its own auth URL secret.
+#
+# Rollback mode: trigger with rollback=true + rollback_sha=<git SHA> to skip
+# regeneration and redeploy from a known-good commit instead.
+#
+# Required repository secrets:
+#   SFDX_AUTH_URL           : SFDX Auth URL for the primary org
+#   NOTIFY_WEBHOOK_URL      : Teams or Slack incoming webhook URL (optional)
+#
+# Required repository variables (Settings > Variables):
+#   SF_API_VERSION          : e.g. 66.0
+#   PERMSET_BRANCH          : e.g. main
+#   DEPLOY_ENABLED          : true/false
+#   DEPLOY_WAIT_MINUTES     : e.g. 10
+#
+# For additional orgs, add their auth URL secrets and reference them
+# in the matrix entries below.
+# ============================================================================
+
+name: "Salesforce Permission Set Reconciliation"
 
 on:
-  workflow_dispatch:
+  # Scheduled runs
   schedule:
-    - cron: "0 6 * * 1"  # Weekly on Monday at 06:00 UTC
+    - cron: "0 2 * * *"   # Daily at 02:00 UTC
+
+  # Manual trigger with full parameter control
+  workflow_dispatch:
+    inputs:
+      skip_deploy:
+        description: "Skip deployment (generate + commit only)"
+        type: boolean
+        default: false
+      dry_run:
+        description: "Dry run (generate only — no commit, no deploy)"
+        type: boolean
+        default: false
+      run_validation:
+        description: "Run Salesforce check-only (validate) deploy before actual deploy"
+        type: boolean
+        default: false
+      fail_on_dangerous_permissions:
+        description: "Fail if a dangerous permission (e.g. ModifyAllData) is newly added"
+        type: boolean
+        default: false
+      rollback:
+        description: "Rollback mode — redeploy from a known-good git commit"
+        type: boolean
+        default: false
+      rollback_sha:
+        description: "Git SHA to roll back to (required when rollback=true)"
+        type: string
+        default: ""
+      notify_on_success:
+        description: "Send notification on successful reconciliation"
+        type: boolean
+        default: true
+      notify_on_failure:
+        description: "Send notification on failure or heal events"
+        type: boolean
+        default: true
+
+# Prevent concurrent runs against the same branch
+concurrency:
+  group: permset-reconciliation-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  PYTHON_VERSION: "3.12"
+  SF_CLI_VERSION: "latest"
+  TOKEN_WARN_DAYS: "7"
+  # Pull from repository variables (fallback defaults for local testing)
+  SF_API_VERSION:       ${{ vars.SF_API_VERSION || '66.0' }}
+  PERMSET_BRANCH:       ${{ vars.PERMSET_BRANCH || 'main' }}
+  DEPLOY_ENABLED:       ${{ vars.DEPLOY_ENABLED || 'true' }}
+  DEPLOY_WAIT_MINUTES:  ${{ vars.DEPLOY_WAIT_MINUTES || '10' }}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# JOBS
+# ─────────────────────────────────────────────────────────────────────────────
 
 jobs:
-  generate-backup-perms:
+
+  # ===========================================================================
+  # Token Health Check
+  # Warns if auth tokens are close to expiry. Hard-fails if already dead.
+  # Skipped during rollback mode.
+  # ===========================================================================
+
+  token-check:
+    name: "Token health — ${{ matrix.org.alias }}"
+    if: ${{ github.event.inputs.rollback != 'true' }}
     runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    strategy:
+      fail-fast: true
+      matrix:
+        org:
+          - alias: prod-backup
+            auth_secret: SFDX_AUTH_URL
+            permset_name: SalesforceBackup
+            permset_label: "Salesforce Backup"
+            output_path: "force-app/main/default/permissionsets/SalesforceBackup.permissionset-meta.xml"
+          # ── Add additional orgs here ──
+          # - alias: sandbox-backup
+          #   auth_secret: SFDX_AUTH_URL_SANDBOX
+          #   permset_name: SalesforceBackup
+          #   permset_label: "Salesforce Backup"
+          #   output_path: "force-app/main/default/permissionsets/SalesforceBackup.permissionset-meta.xml"
+
     steps:
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install Salesforce CLI
+        run: npm install --global @salesforce/cli@${{ env.SF_CLI_VERSION }} --silent
+
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Check token expiry — ${{ matrix.org.alias }}
+        env:
+          ORG_AUTH_URL: ${{ secrets[matrix.org.auth_secret] }}
+        run: |
+          set -euo pipefail
+          AUTH_FILE="$(mktemp)"
+          printf '%s\n' "$ORG_AUTH_URL" > "$AUTH_FILE"
+          chmod 600 "$AUTH_FILE"
+          sf org login sfdx-url --sfdx-url-file "$AUTH_FILE" --set-default --alias "${{ matrix.org.alias }}"
+          rm -f "$AUTH_FILE"
+          sf org display --target-org "${{ matrix.org.alias }}" --json 2>/dev/null \
+            | python3 check_token_expiry.py \
+                --warn-days "${{ env.TOKEN_WARN_DAYS }}" \
+                --org-alias "${{ matrix.org.alias }}"
+
+  # ===========================================================================
+  # Full Reconciliation (one parallel job per org)
+  # ===========================================================================
+
+  reconcile:
+    name: "Reconcile — ${{ matrix.org.alias }}"
+    needs: token-check
+    if: |
+      github.event.inputs.rollback != 'true' &&
+      (needs.token-check.result == 'success' || needs.token-check.result == 'skipped')
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    strategy:
+      fail-fast: false
+      matrix:
+        org:
+          - alias: prod-backup
+            auth_secret: SFDX_AUTH_URL
+            permset_name: SalesforceBackup
+            permset_label: "Salesforce Backup"
+            output_path: "force-app/main/default/permissionsets/SalesforceBackup.permissionset-meta.xml"
+          # ── Add additional orgs here (must match token-check matrix) ──
+
+    steps:
+      # ── Tooling ──────────────────────────────────────────────────────────
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
         uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
+          python-version: ${{ env.PYTHON_VERSION }}
 
       - name: Install Salesforce CLI
-        run: npm install -g @salesforce/cli
+        run: |
+          npm install --global @salesforce/cli@${{ env.SF_CLI_VERSION }} --silent
+          sf --version && python3 --version
 
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git identity
+        run: |
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+
+      # ── Auth ─────────────────────────────────────────────────────────────
       - name: Authenticate to Salesforce
+        env:
+          ORG_AUTH_URL: ${{ secrets[matrix.org.auth_secret] }}
         run: |
-          echo "${{ secrets.SF_AUTH_URL }}" > auth_url.txt
-          sf org login sfdx-url --sfdx-url-file auth_url.txt --set-default --alias ci-org
-          rm auth_url.txt
+          set -euo pipefail
+          AUTH_FILE="$(mktemp)"
+          printf '%s\n' "$ORG_AUTH_URL" > "$AUTH_FILE"
+          chmod 600 "$AUTH_FILE"
+          sf org login sfdx-url --sfdx-url-file "$AUTH_FILE" --set-default --alias "${{ matrix.org.alias }}"
+          rm -f "$AUTH_FILE"
+          sf org display --target-org "${{ matrix.org.alias }}" --json 2>/dev/null \
+            | python3 check_token_expiry.py \
+                --warn-days "${{ env.TOKEN_WARN_DAYS }}" \
+                --org-alias "${{ matrix.org.alias }}"
 
-      - name: Generate and deploy permission set
-        run: python permishifizer9000.py --target-org ci-org --deploy --deploy-wait 10
-
-      - name: Assign permission set
+      # ── Step 1/5  Generate ───────────────────────────────────────────────
+      - name: "Step 1/5 — Regenerate permission set XML"
         run: |
-          sf org assign permset \
-            --name SalesforceBackup \
-            --target-org ci-org
+          set -euo pipefail
+          python3 backuppermissionset.py \
+            --target-org  "${{ matrix.org.alias }}" \
+            --output-file "${{ matrix.org.output_path }}" \
+            --api-version "${{ env.SF_API_VERSION }}" \
+            --name        "${{ matrix.org.permset_name }}" \
+            --label       "${{ matrix.org.permset_label }}"
+          ls -la "${{ matrix.org.output_path }}"
+
+      # ── Step 2/5  Drift report ───────────────────────────────────────────
+      - name: "Step 2/5 — Drift detection & change report"
+        id: drift
+        env:
+          DRIFT_REPORT: "${{ runner.temp }}/drift-${{ matrix.org.alias }}.json"
+        run: |
+          set -euo pipefail
+          OLD_XML="${{ runner.temp }}/old-permset-${{ matrix.org.alias }}.xml"
+          git show "HEAD:${{ matrix.org.output_path }}" > "$OLD_XML" 2>/dev/null || true
+
+          DANGEROUS_FLAG=""
+          if [ "${{ github.event.inputs.fail_on_dangerous_permissions }}" = "true" ]; then
+            DANGEROUS_FLAG="--fail-on-dangerous"
+          fi
+
+          EXIT_CODE=0
+          python3 drift_report.py "$OLD_XML" "${{ matrix.org.output_path }}" \
+            --output "$DRIFT_REPORT" \
+            $DANGEROUS_FLAG || EXIT_CODE=$?
+
+          if [ "$EXIT_CODE" -eq 2 ]; then
+            echo "::error::Dangerous permission(s) newly added — pipeline halted."
+            exit 1
+          fi
+
+      # ── Step 3/5  Validate ───────────────────────────────────────────────
+      - name: "Step 3/5 — Validate permission set"
+        run: |
+          set -euo pipefail
+          CHECK_ONLY=""
+          if [ "${{ github.event.inputs.run_validation }}" = "true" ]; then
+            CHECK_ONLY="--check-only --target-org ${{ matrix.org.alias }} --wait ${{ env.DEPLOY_WAIT_MINUTES }}"
+          fi
+          python3 validate_permset.py "${{ matrix.org.output_path }}" $CHECK_ONLY
+
+      # ── Step 4/5  Commit ─────────────────────────────────────────────────
+      - name: "Step 4/5 — Commit regenerated XML"
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+            echo "Dry run — skipping commit."
+            exit 0
+          fi
+
+          TIMESTAMP=$(date -u +"%Y-%m-%d %H:%M UTC")
+          git add "${{ matrix.org.output_path }}"
+
+          if git diff --cached --quiet; then
+            echo "Org state matches repo — no commit needed."
+          else
+            git commit -m "chore: reconcile ${{ matrix.org.permset_name }} [$TIMESTAMP] | org=${{ matrix.org.alias }} | run=${{ github.run_number }}"
+            git push origin "HEAD:${{ env.PERMSET_BRANCH }}"
+            echo "Committed and pushed."
+          fi
+
+      # ── Step 5/5  Deploy + self-heal loop ────────────────────────────────
+      - name: "Step 5/5 — Deploy to Salesforce (self-healing)"
+        env:
+          NOTIFY_WEBHOOK_URL: ${{ secrets.NOTIFY_WEBHOOK_URL }}
+          DEPLOY_JSON:   "${{ runner.temp }}/deploy-${{ matrix.org.alias }}.json"
+          UNHEALED_JSON: "${{ runner.temp }}/unhealed-${{ matrix.org.alias }}.json"
+          DRIFT_REPORT:  "${{ runner.temp }}/drift-${{ matrix.org.alias }}.json"
+        run: |
+          set -euo pipefail
+
+          if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+            echo "Dry run — skipping deployment."
+            exit 0
+          fi
+
+          if [ "${{ github.event.inputs.skip_deploy }}" = "true" ]; then
+            echo "Deploy skipped by parameter."
+            exit 0
+          fi
+
+          if [ "${{ env.DEPLOY_ENABLED }}" != "true" ]; then
+            echo "DEPLOY_ENABLED != true — skipping."
+            echo "Manual deploy: sf project deploy start --ignore-conflicts --source-dir \"${{ matrix.org.output_path }}\" --target-org ${{ matrix.org.alias }}"
+            exit 0
+          fi
+
+          MAX_ATTEMPTS=5
+          ATTEMPT=0
+
+          while [ $ATTEMPT -lt $MAX_ATTEMPTS ]; do
+            ATTEMPT=$((ATTEMPT + 1))
+            echo ""
+            echo "════════════════════════════════════════"
+            echo " Deploy attempt $ATTEMPT / $MAX_ATTEMPTS  │  org: ${{ matrix.org.alias }}"
+            echo "════════════════════════════════════════"
+
+            sf project deploy start \
+              --ignore-conflicts \
+              --source-dir "${{ matrix.org.output_path }}" \
+              --target-org "${{ matrix.org.alias }}" \
+              --wait "${{ env.DEPLOY_WAIT_MINUTES }}" \
+              --json > "$DEPLOY_JSON" 2>/dev/null || true
+
+            cat "$DEPLOY_JSON"
+
+            STATUS=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('status',1))" "$DEPLOY_JSON" 2>/dev/null || echo "1")
+
+            if [ "$STATUS" = "0" ]; then
+              echo "✓ Deployment succeeded on attempt $ATTEMPT."
+
+              NOTIFY_SUCCESS="${{ github.event.inputs.notify_on_success }}"
+              # Default to true for scheduled runs
+              if [ -z "$NOTIFY_SUCCESS" ]; then NOTIFY_SUCCESS="true"; fi
+
+              if [ "$NOTIFY_SUCCESS" = "true" ]; then
+                python3 notify.py \
+                  --status success \
+                  --org-alias "${{ matrix.org.alias }}" \
+                  --build-number "${{ github.run_number }}" \
+                  --build-url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+                  --permset-path "${{ matrix.org.output_path }}" \
+                  --drift-report "$DRIFT_REPORT" \
+                  || true
+              fi
+              exit 0
+            fi
+
+            echo "✗ Deploy failed on attempt $ATTEMPT — running heal_permset.py..."
+
+            NOTIFY_FAILURE="${{ github.event.inputs.notify_on_failure }}"
+            if [ -z "$NOTIFY_FAILURE" ]; then NOTIFY_FAILURE="true"; fi
+
+            if [ "$NOTIFY_FAILURE" = "true" ] && [ "$ATTEMPT" -eq 1 ]; then
+              python3 notify.py \
+                --status heal \
+                --org-alias "${{ matrix.org.alias }}" \
+                --build-number "${{ github.run_number }}" \
+                --build-url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+                --permset-path "${{ matrix.org.output_path }}" \
+                --attempt "$ATTEMPT" \
+                || true
+            fi
+
+            HEAL_EXIT=0
+            python3 heal_permset.py "$DEPLOY_JSON" "${{ matrix.org.output_path }}" "$UNHEALED_JSON" || HEAL_EXIT=$?
+
+            if [ "$HEAL_EXIT" -ne 0 ]; then
+              echo "::error::Could not auto-heal. Manual intervention required."
+
+              if [ "$NOTIFY_FAILURE" = "true" ]; then
+                python3 notify.py \
+                  --status failure \
+                  --org-alias "${{ matrix.org.alias }}" \
+                  --build-number "${{ github.run_number }}" \
+                  --build-url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+                  --permset-path "${{ matrix.org.output_path }}" \
+                  || true
+              fi
+              exit 1
+            fi
+
+            TIMESTAMP=$(date -u +"%Y-%m-%d %H:%M UTC")
+            git add "${{ matrix.org.output_path }}"
+            if ! git diff --cached --quiet; then
+              git commit -m "fix: auto-heal ${{ matrix.org.permset_name }} attempt $ATTEMPT [$TIMESTAMP] | org=${{ matrix.org.alias }} | run=${{ github.run_number }}"
+              git push origin "HEAD:${{ env.PERMSET_BRANCH }}"
+              echo "Healed XML committed. Retrying..."
+            fi
+          done
+
+          echo "::error::Deployment failed after $MAX_ATTEMPTS attempts."
+
+          NOTIFY_FAILURE="${{ github.event.inputs.notify_on_failure }}"
+          if [ -z "$NOTIFY_FAILURE" ]; then NOTIFY_FAILURE="true"; fi
+
+          if [ "$NOTIFY_FAILURE" = "true" ]; then
+            python3 notify.py \
+              --status failure \
+              --org-alias "${{ matrix.org.alias }}" \
+              --build-number "${{ github.run_number }}" \
+              --build-url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+              --permset-path "${{ matrix.org.output_path }}" \
+              || true
+          fi
+          exit 1
+
+      # ── Upload artifacts ─────────────────────────────────────────────────
+      - name: Upload deploy result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: "deploy-result-${{ matrix.org.alias }}-${{ github.run_id }}"
+          path: "${{ runner.temp }}/deploy-${{ matrix.org.alias }}.json"
+          if-no-files-found: ignore
+          retention-days: 30
+
+      - name: Upload drift report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: "drift-report-${{ matrix.org.alias }}-${{ github.run_id }}"
+          path: "${{ runner.temp }}/drift-${{ matrix.org.alias }}.json"
+          if-no-files-found: ignore
+          retention-days: 30
+
+      - name: Upload unhealed errors
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: "unhealed-errors-${{ matrix.org.alias }}-${{ github.run_id }}"
+          path: "${{ runner.temp }}/unhealed-${{ matrix.org.alias }}.json"
+          if-no-files-found: ignore
+          retention-days: 30
+
+      - name: Pipeline summary
+        if: always()
+        run: |
+          echo "## Reconciliation Summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Field | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|-------|-------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Org** | \`${{ matrix.org.alias }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Permset** | \`${{ matrix.org.output_path }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Run** | ${{ github.run_number }} |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Time** | $(date -u) |" >> "$GITHUB_STEP_SUMMARY"
+
+  # ===========================================================================
+  # Rollback — only when rollback=true
+  # Checks out a specified git SHA, validates the XML, then deploys it.
+  # ===========================================================================
+
+  rollback:
+    name: "Rollback — ${{ matrix.org.alias }}"
+    if: ${{ github.event.inputs.rollback == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    strategy:
+      fail-fast: false
+      matrix:
+        org:
+          - alias: prod-backup
+            auth_secret: SFDX_AUTH_URL
+            permset_name: SalesforceBackup
+            permset_label: "Salesforce Backup"
+            output_path: "force-app/main/default/permissionsets/SalesforceBackup.permissionset-meta.xml"
+
+    steps:
+      - name: Set up Python ${{ env.PYTHON_VERSION }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install Salesforce CLI
+        run: npm install --global @salesforce/cli@${{ env.SF_CLI_VERSION }} --silent
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      # ── Restore from git SHA ─────────────────────────────────────────────
+      - name: "Restore XML from git SHA (${{ github.event.inputs.rollback_sha }})"
+        run: |
+          set -euo pipefail
+          SHA="${{ github.event.inputs.rollback_sha }}"
+
+          if [ -z "$SHA" ]; then
+            echo "::error::rollback_sha parameter is required when rollback=true."
+            exit 1
+          fi
+
+          if ! git cat-file -e "$SHA^{commit}" 2>/dev/null; then
+            echo "::error::Git SHA '$SHA' not found in this repository."
+            echo "Available recent commits:"
+            git log --oneline -10
+            exit 1
+          fi
+
+          echo "Restoring permission set from SHA: $SHA"
+          mkdir -p "$(dirname "${{ matrix.org.output_path }}")"
+          git show "$SHA:${{ matrix.org.output_path }}" > "${{ matrix.org.output_path }}"
+
+          echo ""
+          echo "Restored: ${{ matrix.org.output_path }}"
+          ls -la "${{ matrix.org.output_path }}"
+
+      # ── Validate restored XML ────────────────────────────────────────────
+      - name: Validate restored permission set
+        run: python3 validate_permset.py "${{ matrix.org.output_path }}"
+
+      # ── Auth ─────────────────────────────────────────────────────────────
+      - name: Authenticate to Salesforce
+        env:
+          ORG_AUTH_URL: ${{ secrets[matrix.org.auth_secret] }}
+        run: |
+          set -euo pipefail
+          AUTH_FILE="$(mktemp)"
+          printf '%s\n' "$ORG_AUTH_URL" > "$AUTH_FILE"
+          chmod 600 "$AUTH_FILE"
+          sf org login sfdx-url --sfdx-url-file "$AUTH_FILE" --set-default --alias "${{ matrix.org.alias }}"
+          rm -f "$AUTH_FILE"
+
+      # ── Deploy rolled-back XML ───────────────────────────────────────────
+      - name: Deploy rollback XML
+        env:
+          DEPLOY_JSON: "${{ runner.temp }}/rollback-deploy-${{ matrix.org.alias }}.json"
+        run: |
+          set -euo pipefail
+          echo "Deploying rollback XML to ${{ matrix.org.alias }}..."
+
+          sf project deploy start \
+            --ignore-conflicts \
+            --source-dir "${{ matrix.org.output_path }}" \
+            --target-org "${{ matrix.org.alias }}" \
+            --wait "${{ env.DEPLOY_WAIT_MINUTES }}" \
+            --json > "$DEPLOY_JSON" 2>/dev/null || true
+
+          cat "$DEPLOY_JSON"
+
+          STATUS=$(python3 -c "import json,sys; print(json.load(open(sys.argv[1])).get('status',1))" "$DEPLOY_JSON" 2>/dev/null || echo "1")
+
+          if [ "$STATUS" != "0" ]; then
+            echo "::error::Rollback deployment failed."
+            exit 1
+          fi
+
+          echo "✓ Rollback deployment succeeded."
+
+          SHA="${{ github.event.inputs.rollback_sha }}"
+          TIMESTAMP=$(date -u +"%Y-%m-%d %H:%M UTC")
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name  "github-actions[bot]"
+          git add "${{ matrix.org.output_path }}"
+          git commit -m "rollback: ${{ matrix.org.alias }} → $SHA [$TIMESTAMP] | run=${{ github.run_number }}" || true
+          git push origin "HEAD:${{ env.PERMSET_BRANCH }}" || true
+
+      - name: Upload rollback deploy result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: "rollback-deploy-${{ matrix.org.alias }}-${{ github.run_id }}"
+          path: "${{ runner.temp }}/rollback-deploy-${{ matrix.org.alias }}.json"
+          if-no-files-found: ignore
+          retention-days: 30
+
+      - name: Send rollback notification
+        if: success()
+        env:
+          NOTIFY_WEBHOOK_URL: ${{ secrets.NOTIFY_WEBHOOK_URL }}
+        run: |
+          python3 notify.py \
+            --status success \
+            --org-alias "${{ matrix.org.alias }}" \
+            --build-number "${{ github.run_number }}" \
+            --build-url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --permset-path "${{ matrix.org.output_path }}" \
+            || true
+
+      - name: Rollback summary
+        if: always()
+        run: |
+          echo "## Rollback Summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| Field | Value |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|-------|-------|" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Org** | \`${{ matrix.org.alias }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Target SHA** | \`${{ github.event.inputs.rollback_sha }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Permset** | \`${{ matrix.org.output_path }}\` |" >> "$GITHUB_STEP_SUMMARY"
+          echo "| **Run** | ${{ github.run_number }} |" >> "$GITHUB_STEP_SUMMARY"

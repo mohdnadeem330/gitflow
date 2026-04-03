@@ -102507,10 +102507,6 @@
         <visible>true</visible>
     </recordTypeVisibilities>
     <recordTypeVisibilities>
-        <recordType>Account.NonRegisteredBrokerAgentAccount</recordType>
-        <visible>true</visible>
-    </recordTypeVisibilities>
-    <recordTypeVisibilities>
         <recordType>Account.OrganizationAccount</recordType>
         <visible>true</visible>
     </recordTypeVisibilities>

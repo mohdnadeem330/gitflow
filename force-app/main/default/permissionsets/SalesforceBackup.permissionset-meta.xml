@@ -1,4 +1,4 @@
-<?xml version="1.0" encoding="UTF-8"?>
+<?xml version='1.0' encoding='utf-8'?>
 <PermissionSet xmlns="http://soap.sforce.com/2006/04/metadata">
     <description>Grants object, field, and record type access for full-record backup/restore scope (excluding ChangeEvent and __e event objects).</description>
     <fieldPermissions>
@@ -104129,5 +104129,9 @@
     <userPermissions>
         <enabled>true</enabled>
         <name>ViewSetup</name>
+    </userPermissions>
+    <userPermissions>
+        <enabled>true</enabled>
+        <name>ManageTerritories</name>
     </userPermissions>
 </PermissionSet>

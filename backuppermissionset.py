@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-permishifizer9000.py
+backuppermissionset.py
 
 Generates the SalesforceBackup permission set XML from metadata in a
 connected Salesforce org.  See README.md for full documentation.
@@ -455,6 +455,93 @@ def run_sf_org_display(target_org, sf_invoker):
     return decode_subprocess_output(proc.stdout)
 
 
+def run_sf_show_access_token(target_org, sf_invoker):
+    """
+    Fetch the org access token via the dedicated credential command.
+
+    As of the May 2026 Salesforce CLI security change, `sf org display --json`
+    redacts the accessToken field (it returns a [REDACTED] placeholder).
+    The token must now be retrieved explicitly via
+    `sf org auth show-access-token`. Passing --json both formats the output
+    and suppresses the interactive confirmation prompt, so it is safe for CI.
+    """
+    sf_args = ["org", "auth", "show-access-token", "--json"]
+    if target_org:
+        sf_args.extend(["--target-org", target_org])
+
+    cmd = build_sf_command(sf_invoker, sf_args)
+
+    try:
+        proc = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=False,
+            check=False,
+            timeout=SF_COMMAND_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        die(
+            "Error: `sf org auth show-access-token` timed out.\n"
+            f"  Command: {' '.join(shlex.quote(part) for part in cmd)}\n"
+            f"  Timeout: {SF_COMMAND_TIMEOUT_SECONDS}s"
+        )
+    except OSError as exc:
+        die(f"Error: Failed to invoke Salesforce CLI for token retrieval: {exc}")
+
+    if proc.returncode != 0:
+        stderr = decode_subprocess_output(proc.stderr).strip()
+        stdout = decode_subprocess_output(proc.stdout).strip()
+        details = stderr or stdout or "No additional output from Salesforce CLI."
+        die(
+            "Error: `sf org auth show-access-token` failed.\n"
+            f"  Command: {' '.join(shlex.quote(part) for part in cmd)}\n"
+            f"  Details: {details}\n"
+            "  Ensure the Salesforce CLI is recent enough to provide this\n"
+            "  command (mid-2026 or later) and that the org is authenticated."
+        )
+
+    if proc.stderr:
+        sys.stderr.write(decode_subprocess_output(proc.stderr))
+
+    return decode_subprocess_output(proc.stdout)
+
+
+def extract_access_token(token_json):
+    """
+    Parse the JSON emitted by `sf org auth show-access-token --json` and
+    return the bare access-token string.
+
+    The command places the token in the top-level `result` field. Depending
+    on CLI version `result` may be the bare token string, or a small object
+    containing it; both shapes are handled here.
+    """
+    try:
+        token_info = json.loads(token_json)
+    except json.JSONDecodeError:
+        die(
+            "Error: Could not parse `sf org auth show-access-token` output as JSON.\n"
+            "  Run: sf org login web"
+        )
+
+    if token_info.get("status", 0) != 0:
+        message = token_info.get("message") or "Unknown Salesforce CLI error."
+        die(f"Error: Could not retrieve access token.\n  {message}")
+
+    raw_token = token_info.get("result", "")
+    if isinstance(raw_token, dict):
+        access_token = (
+            raw_token.get("accessToken")
+            or raw_token.get("token")
+            or raw_token.get("access_token")
+            or ""
+        ).strip()
+    else:
+        access_token = (raw_token or "").strip()
+
+    return access_token
+
+
 def run_sf_project_deploy(output_file, target_org, sf_invoker, wait_minutes):
     sf_args = [
         "project",
@@ -847,11 +934,20 @@ def main():
     result = org_info.get("result", {})
     print(f"Connected to Salesforce org: {connected_org_display(result, target_org)}")
 
-    access_token = result.get("accessToken", "")
+    # instanceUrl is not a secret and remains in `sf org display` output.
     instance_url = result.get("instanceUrl", "").rstrip("/")
 
+    # As of the May 2026 CLI security change, the access token is no longer
+    # present in `sf org display --json`; fetch it via the dedicated command.
+    print("Retrieving access token...")
+    token_json = run_sf_show_access_token(target_org, sf_invoker)
+    access_token = extract_access_token(token_json)
+
     if not access_token or not instance_url:
-        die("Error: Could not extract accessToken/instanceUrl from org info.\n  Run: sf org login web")
+        die(
+            "Error: Could not obtain accessToken/instanceUrl.\n"
+            "  Run: sf org login web"
+        )
 
     org = OrgContext(
         access_token=access_token,
